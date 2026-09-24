@@ -1,0 +1,94 @@
+name: YJ-64 Internal Diagnostic Agent APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'buildozer.spec'
+      - 'main.py'
+      - 'services/**'
+      - 'config/**'
+      - '.github/workflows/android-apk.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: yj64-internal-agent-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build internal diagnostic agent APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git zip unzip autoconf automake libtool libltdl-dev pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo6 cmake libffi-dev libssl-dev build-essential gettext autopoint
+
+      - name: Install Buildozer and Cython
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install buildozer cython==0.29.36
+
+      - name: Validate sources
+        run: python -m py_compile main.py services/internal_monitor.py
+
+      - name: Clean previous Android build artifacts and logs
+        run: |
+          rm -rf bin .buildozer
+          rm -f build.log buildozer.log
+          mkdir -p bin
+
+      - name: Build APK
+        run: |
+          export ACLOCAL_PATH="/usr/share/aclocal"
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Validate APK output
+        run: |
+          set -e
+          APK=$(find bin -maxdepth 1 -type f -name '*.apk' | head -n 1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: no APK was produced"
+            exit 1
+          fi
+          stat -c '%n %s bytes' "$APK"
+          sha256sum "$APK"
+
+      - name: Upload Build log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: yj64-internal-agent-build-log
+          path: build.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload APK
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: yj64-internal-agent-apk
+          path: bin/*.apk
+          if-no-files-found: warn
+          retention-days: 30
