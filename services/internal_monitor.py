@@ -90,6 +90,55 @@ def send_with_retry(config: dict[str, Any], report: dict[str, Any]) -> bool:
     return False
 
 
+def upload_https(endpoint: str, report: dict[str, Any], timeout: float = 5.0) -> bool:
+    if not endpoint:
+        return False
+    try:
+        body = json.dumps(report).encode("utf-8")
+        req = request.Request(
+            endpoint,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with request.urlopen(req, timeout=timeout) as response:
+            return 200 <= int(response.status) < 300
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def self_diagnostic(config: dict[str, Any], service: Any) -> dict[str, Any]:
+    checks: dict[str, Any] = {}
+    try:
+        config["agent_id"]
+        config["target_package"]
+        config["bridge"]["host"]
+        config["bridge"]["port"]
+        checks["configuration"] = "ok"
+    except (KeyError, TypeError):
+        checks["configuration"] = "invalid"
+
+    try:
+        probe = Path(str(service.getFilesDir())) / ".diagnostic_write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        checks["storage"] = "ok"
+    except OSError:
+        checks["storage"] = "unavailable"
+
+    try:
+        package_manager = service.getPackageManager()
+        visible = package_manager.getLaunchIntentForPackage(
+            str(config["target_package"])
+        ) is not None
+        checks["target_visibility"] = "visible" if visible else "not_visible"
+    except Exception as exc:
+        checks["target_visibility"] = f"probe_error:{type(exc).__name__}"
+
+    checks["process"] = "ok"
+    return checks
+
+
 def launch_target(package_name: str) -> tuple[bool, str]:
     try:
         context = autoclass("org.kivy.android.PythonService").mService
@@ -143,7 +192,7 @@ def run() -> None:
         {
             "agent": agent_id,
             "event": "target_launch_result",
-            "bridge_status": "connected" if bridge_ok else "spooled",
+            "bridge_status": "connected" if diagnostic_bridge_ok and bridge_ok else "spooled",
             "target_launch": launch_reason,
             "target_success": launch_ok,
             "launch_report_sent": launch_bridge_ok,
