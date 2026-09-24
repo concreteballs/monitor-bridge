@@ -1,0 +1,16 @@
+{
+  "agent_id": "yj64-internal-diagnostic-agent",
+  "target_package": "org.blackmirror.blackmirror",
+  "bridge": {
+    "host": "127.0.0.1",
+    "port": 9333,
+    "token": "yj64-dev-bridge-v1",
+    "connect_timeout_seconds": 1.0,
+    "retry_count": 3,
+    "retry_delay_seconds": 0.5
+  },
+  "report": {
+    "spool_filename": "diagnostic-reports.jsonl",
+    "https_endpoint": ""
+  }
+}
