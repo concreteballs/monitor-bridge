@@ -7,6 +7,7 @@ import os
 import socket
 import sys
 import time
+from datetime import datetime, timezone
 import uuid
 from pathlib import Path
 from typing import Any
@@ -30,13 +31,29 @@ def spool_path(service: Any, filename: str) -> Path:
     return Path(str(service.getFilesDir())) / filename
 
 
+_report_sequence = 0
+
+
+def _new_message_metadata(prefix: str) -> dict[str, Any]:
+    global _report_sequence
+    _report_sequence += 1
+    return {
+        "message_id": f"{prefix}-{uuid.uuid4().hex}",
+        "sequence": _report_sequence,
+        "wall_time": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+        "monotonic_ns": time.monotonic_ns(),
+    }
+
+
 def make_report(agent_id: str, event: str, **data: Any) -> dict[str, Any]:
+    metadata = _new_message_metadata("INT")
     return {
         "schema": SCHEMA,
         "agent": agent_id,
         "event": event,
         "timestamp_ms": int(time.time() * 1000),
-        "report_id": uuid.uuid4().hex,
+        **metadata,
+        "report_id": metadata["message_id"],
         "data": data,
     }
 
@@ -53,42 +70,55 @@ def send_bridge(
     token: str,
     timeout: float,
     report: dict[str, Any],
-) -> bool:
-    envelope = {"token": token, "report": report}
+) -> dict[str, Any] | None:
+    envelope = {
+        "token": token,
+        "report": report,
+        "sent_at_wall_time": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+        "sent_monotonic_ns": time.monotonic_ns(),
+    }
     payload = (json.dumps(envelope, sort_keys=True) + "\n").encode("utf-8")
     try:
         with socket.create_connection((host, port), timeout=timeout) as connection:
             connection.sendall(payload)
             connection.settimeout(timeout)
-            response = connection.recv(4096).decode("utf-8", errors="replace").strip()
+            response = connection.recv(8192).decode("utf-8", errors="replace").strip()
+            response_received_wall_time = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            response_received_monotonic_ns = time.monotonic_ns()
             if not response:
-                return False
+                return None
             ack = json.loads(response)
-            return (
-                ack.get("ok") is True
-                and ack.get("report_id") == report["report_id"]
-            )
+            if not isinstance(ack, dict):
+                return None
+            ack["client_received_wall_time"] = response_received_wall_time
+            ack["client_received_monotonic_ns"] = response_received_monotonic_ns
+            if ack.get("ok") is not True:
+                return ack
+            if ack.get("report_id") != report["report_id"]:
+                return None
+            return ack
     except (OSError, ValueError, TypeError):
-        return False
+        return None
 
-
-def send_with_retry(config: dict[str, Any], report: dict[str, Any]) -> bool:
+def send_with_retry(
+    config: dict[str, Any], report: dict[str, Any]
+) -> dict[str, Any] | None:
     bridge = config["bridge"]
     attempts = int(bridge["retry_count"])
     delay = float(bridge["retry_delay_seconds"])
     for attempt in range(max(1, attempts)):
-        if send_bridge(
+        ack = send_bridge(
             str(bridge["host"]),
             int(bridge["port"]),
             str(bridge["token"]),
             float(bridge["connect_timeout_seconds"]),
             report,
-        ):
-            return True
+        )
+        if ack is not None and ack.get("ok") is True:
+            return ack
         if attempt + 1 < attempts:
             time.sleep(delay)
-    return False
-
+    return None
 
 def upload_https(endpoint: str, report: dict[str, Any], timeout: float = 5.0) -> bool:
     if not endpoint:
@@ -154,6 +184,67 @@ def launch_target(package_name: str) -> tuple[bool, str]:
         return False, f"launch_error:{type(exc).__name__}"
 
 
+
+
+def execute_bridge_command(
+    config: dict[str, Any],
+    service: Any,
+    spool: Path,
+    command: dict[str, Any],
+) -> None:
+    """Execute a one-shot command delivered by the external monitor."""
+    command_id = str(command.get("message_id", ""))
+    command_type = str(command.get("command", ""))
+    received_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    received_monotonic = time.monotonic_ns()
+
+    if command_type != "RUN_DIAGNOSTIC_TEST":
+        report = make_report(
+            str(config["agent_id"]),
+            "bridge_command_rejected",
+            command=command_type,
+            command_id=command_id,
+            reason="unsupported_command",
+            received_at_wall_time=received_at,
+            received_monotonic_ns=received_monotonic,
+        )
+        send_report_or_spool(config, service, spool, report)
+        return
+
+    result = {
+        "command": command_type,
+        "command_id": command_id,
+        "accepted": True,
+        "received_at_wall_time": received_at,
+        "received_monotonic_ns": received_monotonic,
+        "bridge_ack_wall_time": command.get("ack_wall_time"),
+        "bridge_ack_monotonic_ns": command.get("ack_monotonic_ns"),
+        "client_received_wall_time": command.get("client_received_wall_time"),
+        "client_received_monotonic_ns": command.get("client_received_monotonic_ns"),
+        "test": "external_to_internal_bridge",
+        "message": "External monitor command received by internal diagnostic monitor.",
+    }
+    report = make_report(
+        str(config["agent_id"]),
+        "diagnostic_test_result",
+        **result,
+    )
+    write_status(
+        service,
+        {
+            "agent": str(config["agent_id"]),
+            "event": "diagnostic_test_result",
+            "bridge_status": "connected",
+            "target_launch": "launched",
+            "target_success": True,
+            "last_command": command,
+            "last_report": report,
+            "diagnostic_test": result,
+        },
+    )
+    send_report_or_spool(config, service, spool, report)
+
+
 def run() -> None:
     PythonService = autoclass("org.kivy.android.PythonService")
     service = PythonService.mService
@@ -170,8 +261,8 @@ def run() -> None:
         target_package=config["target_package"],
         cwd=os.getcwd(),
     )
-    bridge_ok = send_with_retry(config, startup)
-    if not bridge_ok:
+    startup_ack = send_with_retry(config, startup)
+    if startup_ack is None:
         append_spool(service, spool, startup)
 
     launch_ok, launch_reason = launch_target(str(config["target_package"]))
@@ -181,21 +272,24 @@ def run() -> None:
         target_package=config["target_package"],
         success=launch_ok,
         reason=launch_reason,
-        bridge_received_startup=bridge_ok,
+        bridge_received_startup=bool(startup_ack),
     )
-    launch_bridge_ok = send_with_retry(config, launch_report)
-    if not launch_bridge_ok:
+    launch_ack = send_with_retry(config, launch_report)
+    if launch_ack is None:
         append_spool(service, spool, launch_report)
+
+    if launch_ack and isinstance(launch_ack.get("command"), dict):
+        execute_bridge_command(config, service, spool, launch_ack["command"])
 
     write_status(
         service,
         {
             "agent": agent_id,
             "event": "target_launch_result",
-            "bridge_status": "connected" if diagnostic_bridge_ok and bridge_ok else "spooled",
+            "bridge_status": "connected" if startup_ack or launch_ack else "spooled",
             "target_launch": launch_reason,
             "target_success": launch_ok,
-            "launch_report_sent": launch_bridge_ok,
+            "launch_report_sent": bool(launch_ack),
         },
     )
 
